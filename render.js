@@ -4,22 +4,15 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-/* ─── OUTPUT SETTINGS ────────────────────────────────────
-   W/H determine the ffmpeg capture window. Both Xvfb (in the
-   workflow) and Chrome (below) must match.
-   1920x1080 = 16:9 landscape, the standard YouTube upload.
-   ──────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────
+   OUTPUT SIZE — this is the ONLY place that defines resolution.
+   The workflow's Xvfb line must match (2560x1440x24).
+   Everything else reads from W and H.
+   ───────────────────────────────────────────────────────── */
 const W = 2560;
 const H = 1440;
 const FPS = 60;
 
-/* ─── QUALITY SETTINGS ───────────────────────────────────
-   CRF:  0–51, lower = higher quality. 14 is visually lossless.
-         YouTube re-encodes anyway, so going below 14 is wasted.
-   preset: ultrafast → fast → medium → slow → veryslow.
-         slower = better compression at same quality, at the cost
-         of CPU time. 'medium' is the sweet spot.
-   ──────────────────────────────────────────────────────── */
 const CRF = 14;
 const PRESET = 'medium';
 
@@ -33,11 +26,10 @@ function xdo(args){
 
 async function main(){
   const htmlPath = path.join(__dirname, 'study-planner.html');
-  if(!fs.existsSync(htmlPath)){
-    throw new Error('study-planner.html not found in repo root');
-  }
+  if(!fs.existsSync(htmlPath)) throw new Error('study-planner.html not found');
   const html = fs.readFileSync(htmlPath, 'utf8');
-  console.log('Loaded study-planner.html (' + html.length + ' bytes)');
+  console.log('Loaded HTML (' + html.length + ' bytes)');
+  console.log('Target output: ' + W + 'x' + H + ' @ ' + FPS + 'fps');
 
   let events = null;
   const evPath = path.join(__dirname, 'events.json');
@@ -45,12 +37,10 @@ async function main(){
     try{
       events = JSON.parse(fs.readFileSync(evPath, 'utf8'));
       if(!Array.isArray(events)) events = null;
-      else console.log('Found events.json — ' + events.length + ' events');
-    }catch(e){
-      console.log('events.json parse error, using scripted tour');
-    }
+      else console.log('events.json — ' + events.length + ' events');
+    }catch(e){}
   }
-  if(!events) console.log('No events.json — using scripted tour');
+  if(!events) console.log('No events.json — scripted tour');
 
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -58,7 +48,6 @@ async function main(){
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
-  console.log('Server listening on ' + port);
 
   console.log('Launching Chrome…');
   const browser = await puppeteer.launch({
@@ -72,7 +61,7 @@ async function main(){
       '--disable-gpu-sandbox',
       '--window-size=' + W + ',' + H,
       '--window-position=0,0',
-      '--kiosk',
+      '--start-maximized',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-infobars',
@@ -86,7 +75,38 @@ async function main(){
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
+
+  // Force the Chrome window to fill the whole Xvfb display, since without
+  // a window manager, --window-size isn't always honored. xdotool talks
+  // straight to X11 and sets the window size deterministically.
+  try{
+    const winIdOut = await new Promise(res => {
+      exec("xdotool search --onlyvisible --class 'google-chrome' | head -n1",
+        { env: { ...process.env, DISPLAY: ':99' } },
+        (err, stdout) => res(stdout.trim())
+      );
+    });
+    if(winIdOut){
+      await xdo('windowsize ' + winIdOut + ' ' + W + ' ' + H);
+      await xdo('windowmove ' + winIdOut + ' 0 0');
+      console.log('Chrome window forced to ' + W + 'x' + H);
+    } else {
+      console.log('Could not locate Chrome window via xdotool; relying on --window-size');
+    }
+  }catch(e){ console.log('Window sizing via xdotool skipped:', e.message); }
+
   await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+
+  // Verify the actual viewport Chrome ended up with
+  const actualVP = await page.evaluate(() => ({
+    w: window.innerWidth,
+    h: window.innerHeight,
+    dpr: window.devicePixelRatio
+  }));
+  console.log('Actual viewport in browser: ' + actualVP.w + 'x' + actualVP.h + ' @ dpr ' + actualVP.dpr);
+  if(actualVP.w !== W || actualVP.h !== H){
+    console.log('⚠ Viewport differs from target — ffmpeg will still capture the full ' + W + 'x' + H + ' display');
+  }
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
 
@@ -114,54 +134,49 @@ async function main(){
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
   await sleep(3500);
 
-  /* ─── FFMPEG CAPTURE ─────────────────────────────────────
-     Records the Xvfb virtual display at WxH @ FPS, encodes with
-     libx264 at high-quality CRF, adds a silent AAC track so the
-     MP4 is universally playable, tags BT.709 colors, and sets
-     the standard H.264 profile YouTube expects.
-     ──────────────────────────────────────────────────────── */
-  console.log('Starting ffmpeg (CRF ' + CRF + ', preset ' + PRESET + ')…');
+  /* ─────────────────────────────────────────────────────────
+     FFMPEG CAPTURE — 2560x1440 from Xvfb, scaled to exactly
+     WxH on output. The scale filter is what guarantees the
+     final file is exactly 2560x1440 even if the X11 display
+     or the input grabbed a slightly different size.
+     ───────────────────────────────────────────────────────── */
+  console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
 
-    // Video input: the Xvfb display
     '-f', 'x11grab',
     '-framerate', String(FPS),
     '-video_size', W + 'x' + H,
     '-draw_mouse', '1',
     '-i', ':99',
 
-    // Silent stereo audio input
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
 
-    // Video codec + quality
+    // Force exact output resolution + square pixels
+    '-vf', 'scale=' + W + ':' + H + ':force_original_aspect_ratio=decrease,pad=' + W + ':' + H + ':(ow-iw)/2:(oh-ih)/2:color=black,setsar=1',
+
     '-c:v', 'libx264',
     '-preset', PRESET,
     '-crf', String(CRF),
     '-pix_fmt', 'yuv420p',
     '-profile:v', 'high',
-    '-level', '4.2',
-    '-maxrate', '30M',
-    '-bufsize', '60M',
-    '-g', String(FPS * 2),   // keyframe every 2s → smooth seeking
+    '-level', '5.1',
+    '-maxrate', '50M',
+    '-bufsize', '100M',
+    '-g', String(FPS * 2),
     '-r', String(FPS),
 
-    // Correct color metadata
     '-colorspace', 'bt709',
     '-color_primaries', 'bt709',
     '-color_trc', 'bt709',
 
-    // Audio codec
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
     '-ac', '2',
 
-    // Stop when the video stream ends
     '-shortest',
-
-    // Fast-start for web/YouTube (moov atom at front)
     '-movflags', '+faststart',
 
     'output.mp4',
@@ -173,14 +188,9 @@ async function main(){
   await sleep(2500);
 
   try{
-    if(events && events.length){
-      await replayEvents(page, events);
-    } else {
-      await scriptedTour(page);
-    }
-  }catch(e){
-    console.error('Replay error:', e);
-  }
+    if(events && events.length) await replayEvents(page, events);
+    else await scriptedTour(page);
+  }catch(e){ console.error('Replay error:', e); }
 
   await sleep(1500);
 
@@ -192,13 +202,19 @@ async function main(){
   server.close();
 
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 generated — ' + (size / 1048576).toFixed(1) + ' MB');
+  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB');
+  console.log('   Expected resolution: ' + W + 'x' + H);
 }
 
 async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
+
+  // events.json was recorded on a viewport that was likely 1920 wide.
+  // Scale the coordinates so they land in the right spot on the 2560-wide render.
+  const SCALE_X = W / 1920;
+  const SCALE_Y = H / 1080;
 
   for(const ev of events){
     const wait = ev.t - (Date.now() - t0);
@@ -207,18 +223,22 @@ async function replayEvents(page, events){
     try{
       if(ev.type === 'scroll'){
         if(ev.target === 'html' || !ev.target){
-          await page.evaluate(top => window.scrollTo(0, top), ev.top || 0);
+          // Scale scroll distance by viewport height ratio
+          const scaledTop = (ev.top || 0) * SCALE_Y;
+          await page.evaluate(top => window.scrollTo(0, top), scaledTop);
         } else {
           await page.evaluate((sel, top) => {
             const el = document.querySelector(sel);
             if(el) el.scrollTop = top;
-          }, ev.target, ev.top || 0);
+          }, ev.target, (ev.top || 0) * SCALE_Y);
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          const cx = Math.round(ev.x * SCALE_X);
+          const cy = Math.round(ev.y * SCALE_Y);
+          await xdo('mousemove ' + cx + ' ' + cy);
           await sleep(30);
-          await page.mouse.click(ev.x, ev.y);
+          await page.mouse.click(cx, cy);
         } else if(ev.target){
           await page.evaluate(sel => {
             const el = document.querySelector(sel);
@@ -227,7 +247,7 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'move'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          await xdo('mousemove ' + Math.round(ev.x * SCALE_X) + ' ' + Math.round(ev.y * SCALE_Y));
         }
       } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
@@ -239,15 +259,13 @@ async function replayEvents(page, events){
           }
         }, ev.target, ev.value);
       }
-    }catch(e){
-      console.log('skip event ' + ev.type + ': ' + e.message);
-    }
+    }catch(e){ console.log('skip ' + ev.type + ': ' + e.message); }
   }
   console.log('Replay complete');
 }
 
 async function scriptedTour(page){
-  console.log('Running scripted tour…');
+  console.log('Scripted tour…');
   await sleep(2000);
 
   await page.evaluate(async () => {
@@ -275,24 +293,12 @@ async function scriptedTour(page){
   await sleep(500);
 
   const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
-
-  await click('.ai-report-btn');
-  await sleep(7000);
-  await click('.mcls');
-  await sleep(800);
-
-  await click('.bhold');
-  await sleep(3000);
-  await click('.mcls');
-  await sleep(800);
-
-  await click('.bpw');
-  await sleep(3000);
-
+  await click('.ai-report-btn');  await sleep(7000);
+  await click('.mcls');           await sleep(800);
+  await click('.bhold');          await sleep(3000);
+  await click('.mcls');           await sleep(800);
+  await click('.bpw');            await sleep(3000);
   await sleep(1500);
 }
 
-main().catch(err => {
-  console.error('FATAL:', err);
-  process.exit(1);
-});
+main().catch(err => { console.error('FATAL:', err); process.exit(1); });
