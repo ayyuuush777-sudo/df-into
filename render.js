@@ -4,8 +4,13 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-const W = 1920;
-const H = 1080;
+// CSS layout size (what the app "thinks" the screen is)
+const LAYOUT_W = 1920;
+const LAYOUT_H = 1080;
+// Physical pixel size (what ffmpeg captures) — 2x density
+const OUT_W = 3840;
+const OUT_H = 2160;
+const SCALE = 2;
 const FPS = 60;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -17,7 +22,6 @@ function xdo(args){
 }
 
 async function main(){
-  // 1. Load the app HTML
   const htmlPath = path.join(__dirname, 'study-planner.html');
   if(!fs.existsSync(htmlPath)){
     throw new Error('study-planner.html not found in repo root');
@@ -25,7 +29,6 @@ async function main(){
   const html = fs.readFileSync(htmlPath, 'utf8');
   console.log('Loaded study-planner.html (' + html.length + ' bytes)');
 
-  // 2. Load events.json if present
   let events = null;
   const evPath = path.join(__dirname, 'events.json');
   if(fs.existsSync(evPath)){
@@ -39,7 +42,6 @@ async function main(){
   }
   if(!events) console.log('No events.json — using scripted tour');
 
-  // 3. Tiny HTTP server serving the HTML
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
@@ -48,8 +50,8 @@ async function main(){
   const port = server.address().port;
   console.log('Server listening on ' + port);
 
-  // 4. Launch Chrome fullscreen on Xvfb :99
-  console.log('Launching Chrome…');
+  console.log('Launching Chrome — layout ' + LAYOUT_W + 'x' + LAYOUT_H +
+              ', output ' + OUT_W + 'x' + OUT_H);
   const browser = await puppeteer.launch({
     executablePath: '/usr/bin/google-chrome-stable',
     headless: false,
@@ -59,14 +61,14 @@ async function main(){
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu-sandbox',
-      '--window-size=' + W + ',' + H,
+      '--window-size=' + LAYOUT_W + ',' + LAYOUT_H,
       '--window-position=0,0',
       '--kiosk',
+      '--force-device-scale-factor=' + SCALE,
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-infobars',
       '--hide-scrollbars',
-      '--force-device-scale-factor=1',
       '--disable-features=Translate,ChromeWhatsNewUI,MediaRouter',
       '--disable-component-update',
       '--disable-background-networking',
@@ -75,12 +77,14 @@ async function main(){
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
-  await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+  await page.setViewport({
+    width: LAYOUT_W,
+    height: LAYOUT_H,
+    deviceScaleFactor: SCALE,
+  });
 
-  // Auto-accept any alert/confirm
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
 
-  // localStorage shim (some sandboxed contexts block it)
   await page.evaluateOnNewDocument(() => {
     try { localStorage.setItem('_t','1'); localStorage.removeItem('_t'); }
     catch(e){
@@ -99,26 +103,29 @@ async function main(){
   console.log('Loading page…');
   await page.goto('http://127.0.0.1:' + port + '/', {
     waitUntil: 'networkidle0',
-    timeout: 60000,
+    timeout: 90000,
   });
 
-  // Wait for fonts and give the page a beat to settle
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
-  await sleep(3500);
+  await sleep(5000);
 
-  // 5. Start ffmpeg capturing the virtual display
-  console.log('Starting ffmpeg…');
+  console.log('Starting ffmpeg at ' + OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
     '-f', 'x11grab',
     '-framerate', String(FPS),
-    '-video_size', W + 'x' + H,
+    '-video_size', OUT_W + 'x' + OUT_H,
     '-draw_mouse', '1',
     '-i', ':99',
     '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-crf', '18',
+    '-preset', 'medium',
+    '-crf', '14',
+    '-tune', 'stillimage',
     '-pix_fmt', 'yuv420p',
+    '-colorspace', 'bt709',
+    '-color_primaries', 'bt709',
+    '-color_trc', 'bt709',
+    '-movflags', '+faststart',
     '-r', String(FPS),
     'output.mp4',
   ], {
@@ -126,11 +133,11 @@ async function main(){
     env: { ...process.env, DISPLAY: ':99' },
   });
 
-  await sleep(2500); // warm-up
+  await sleep(3000);
 
-  // 6. Replay the movements
   try{
     if(events && events.length){
+      // xdotool needs the physical pixel coords — scale up the recorded coords
       await replayEvents(page, events);
     } else {
       await scriptedTour(page);
@@ -141,25 +148,17 @@ async function main(){
 
   await sleep(1500);
 
-  // 7. Stop ffmpeg gracefully
   console.log('Stopping ffmpeg…');
   ffmpeg.stdin.write('q');
   await new Promise(r => ffmpeg.on('exit', r));
 
-  // 8. Cleanup
   await browser.close();
   server.close();
 
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 generated — ' + (size / 1048576).toFixed(1) + ' MB');
+  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' + OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps');
 }
 
-/* ──────────────────────────────────────────────────────
-   REPLAY: uses your recorded events.json
-   Puppeteer handles DOM-level actions (scroll, click on
-   elements by selector, input). xdotool moves the real X
-   cursor so it appears in the ffmpeg recording.
-   ────────────────────────────────────────────────────── */
 async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
@@ -181,8 +180,10 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          // Physical pixel coords for xdotool (cursor overlay)
+          await xdo('mousemove ' + (ev.x * SCALE) + ' ' + (ev.y * SCALE));
           await sleep(30);
+          // Puppeteer clicks in CSS pixel coords (layout space)
           await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
           await page.evaluate(sel => {
@@ -192,7 +193,7 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'move'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          await xdo('mousemove ' + (ev.x * SCALE) + ' ' + (ev.y * SCALE));
         }
       } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
@@ -211,14 +212,10 @@ async function replayEvents(page, events){
   console.log('Replay complete');
 }
 
-/* ──────────────────────────────────────────────────────
-   SCRIPTED TOUR: used only if events.json is absent
-   ────────────────────────────────────────────────────── */
 async function scriptedTour(page){
   console.log('Running scripted tour…');
-  await sleep(2000);
+  await sleep(2500);
 
-  // Slow scroll down
   await page.evaluate(async () => {
     const max = document.body.scrollHeight - window.innerHeight;
     const steps = 200, dt = 30;
@@ -229,9 +226,8 @@ async function scriptedTour(page){
       await new Promise(r => setTimeout(r, dt));
     }
   });
-  await sleep(1000);
+  await sleep(1200);
 
-  // Back to top
   await page.evaluate(async () => {
     const start = window.scrollY;
     const steps = 150, dt = 25;
@@ -242,25 +238,22 @@ async function scriptedTour(page){
       await new Promise(r => setTimeout(r, dt));
     }
   });
-  await sleep(500);
+  await sleep(700);
 
   const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
 
-  // AI Report
   await click('.ai-report-btn');
-  await sleep(7000);
+  await sleep(7500);
   await click('.mcls');
-  await sleep(800);
+  await sleep(900);
 
-  // My Hold
   await click('.bhold');
-  await sleep(3000);
+  await sleep(3200);
   await click('.mcls');
-  await sleep(800);
+  await sleep(900);
 
-  // PW Schedule
   await click('.bpw');
-  await sleep(3000);
+  await sleep(3200);
 
   await sleep(1500);
 }
