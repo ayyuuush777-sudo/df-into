@@ -1,260 +1,268 @@
-const puppeteer = require('puppeteer');
-const { PuppeteerScreenRecorder } = require('puppeteer-screen-recorder');
+const puppeteer = require('puppeteer-core');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { spawn, exec } = require('child_process');
 
-/* ──────────────────────────────────────────────────────────
-   CONFIG — tweak these to change the output
-   ────────────────────────────────────────────────────────── */
-const WIDTH = 1920;
-const HEIGHT = 1080;
+const W = 1920;
+const H = 1080;
 const FPS = 60;
-const DEVICE_SCALE = 2;      // 2 = retina-quality text and gradients
-const VIDEO_QUALITY_CRF = 16; // lower = higher quality (16 is visually lossless)
-const VIDEO_BITRATE_KBPS = 30000;
 
-async function main() {
-  console.log('Reading study-planner.html…');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function xdo(args){
+  return new Promise(resolve => {
+    exec('xdotool ' + args, { env: { ...process.env, DISPLAY: ':99' } }, () => resolve());
+  });
+}
+
+async function main(){
+  // 1. Load the app HTML
   const htmlPath = path.join(__dirname, 'study-planner.html');
-  if (!fs.existsSync(htmlPath)) {
-    throw new Error('study-planner.html not found in repo root. Upload it first.');
+  if(!fs.existsSync(htmlPath)){
+    throw new Error('study-planner.html not found in repo root');
   }
   const html = fs.readFileSync(htmlPath, 'utf8');
+  console.log('Loaded study-planner.html (' + html.length + ' bytes)');
 
-  // Optional: real recorded events, if events.json is present
+  // 2. Load events.json if present
   let events = null;
-  const eventsPath = path.join(__dirname, 'events.json');
-  if (fs.existsSync(eventsPath)) {
-    events = JSON.parse(fs.readFileSync(eventsPath, 'utf8'));
-    console.log(`Found events.json — will replay ${events.length} real events`);
-  } else {
-    console.log('No events.json — using scripted tour');
+  const evPath = path.join(__dirname, 'events.json');
+  if(fs.existsSync(evPath)){
+    try{
+      events = JSON.parse(fs.readFileSync(evPath, 'utf8'));
+      if(!Array.isArray(events)) events = null;
+      else console.log('Found events.json — ' + events.length + ' events');
+    }catch(e){
+      console.log('events.json parse error, using scripted tour');
+    }
   }
+  if(!events) console.log('No events.json — using scripted tour');
 
-  // Spin up a tiny local HTTP server so the page loads over http://
-  // (file:// blocks some APIs and makes font loading flaky)
+  // 3. Tiny HTTP server serving the HTML
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
-  console.log(`Local server on port ${port}`);
+  console.log('Server listening on ' + port);
 
-  console.log('Launching headless Chrome…');
+  // 4. Launch Chrome fullscreen on Xvfb :99
+  console.log('Launching Chrome…');
   const browser = await puppeteer.launch({
-    headless: true,
+    executablePath: '/usr/bin/google-chrome-stable',
+    headless: false,
+    defaultViewport: null,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu-sandbox',
-      '--window-size=' + WIDTH + ',' + HEIGHT,
-      '--force-device-scale-factor=' + DEVICE_SCALE,
-      '--font-render-hinting=none',
-      '--disable-web-security',
+      '--window-size=' + W + ',' + H,
+      '--window-position=0,0',
+      '--kiosk',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-infobars',
+      '--hide-scrollbars',
+      '--force-device-scale-factor=1',
+      '--disable-features=Translate,ChromeWhatsNewUI,MediaRouter',
+      '--disable-component-update',
+      '--disable-background-networking',
     ],
   });
 
-  const page = await browser.newPage();
-  await page.setViewport({
-    width: WIDTH,
-    height: HEIGHT,
-    deviceScaleFactor: DEVICE_SCALE,
-  });
+  const pages = await browser.pages();
+  const page = pages[0] || await browser.newPage();
+  await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
 
-  // Swallow any alert/confirm/prompt so nothing blocks the render
-  page.on('dialog', async d => { try { await d.accept(); } catch(e) {} });
+  // Auto-accept any alert/confirm
+  page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
 
-  // Some environments block localStorage — inject a shim just in case
+  // localStorage shim (some sandboxed contexts block it)
   await page.evaluateOnNewDocument(() => {
     try { localStorage.setItem('_t','1'); localStorage.removeItem('_t'); }
-    catch(e) {
+    catch(e){
       const m = {};
-      Object.defineProperty(window, 'localStorage', {
-        configurable: true,
-        value: {
-          getItem: k => (k in m ? m[k] : null),
-          setItem: (k,v) => { m[k] = String(v); },
-          removeItem: k => { delete m[k]; },
-          clear: () => { for (const k in m) delete m[k]; },
-          key: i => Object.keys(m)[i] || null,
-          get length() { return Object.keys(m).length; },
-        },
-      });
+      Object.defineProperty(window, 'localStorage', { configurable: true, value: {
+        getItem: k => (k in m ? m[k] : null),
+        setItem: (k,v) => { m[k] = String(v); },
+        removeItem: k => { delete m[k]; },
+        clear: () => { for (const k in m) delete m[k]; },
+        key: i => Object.keys(m)[i] || null,
+        get length(){ return Object.keys(m).length; },
+      }});
     }
   });
 
   console.log('Loading page…');
-  await page.goto(`http://127.0.0.1:${port}/`, {
+  await page.goto('http://127.0.0.1:' + port + '/', {
     waitUntil: 'networkidle0',
     timeout: 60000,
   });
 
-  // Wait for Google Fonts + Font Awesome to finish
-  try { await page.evaluate(() => document.fonts.ready); } catch (e) {}
-  await new Promise(r => setTimeout(r, 2500));
+  // Wait for fonts and give the page a beat to settle
+  try { await page.evaluate(() => document.fonts.ready); } catch(e){}
+  await sleep(3500);
 
-  console.log('Starting recorder…');
-  const recorder = new PuppeteerScreenRecorder(page, {
-    followNewTab: false,
-    fps: FPS,
-    videoFrame: { width: WIDTH, height: HEIGHT },
-    videoCrf: VIDEO_QUALITY_CRF,
-    videoCodec: 'libx264',
-    videoPreset: 'slow',
-    videoBitrate: VIDEO_BITRATE_KBPS,
-    aspectRatio: '16:9',
+  // 5. Start ffmpeg capturing the virtual display
+  console.log('Starting ffmpeg…');
+  const ffmpeg = spawn('ffmpeg', [
+    '-y',
+    '-f', 'x11grab',
+    '-framerate', String(FPS),
+    '-video_size', W + 'x' + H,
+    '-draw_mouse', '1',
+    '-i', ':99',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-crf', '18',
+    '-pix_fmt', 'yuv420p',
+    '-r', String(FPS),
+    'output.mp4',
+  ], {
+    stdio: ['pipe', 'inherit', 'inherit'],
+    env: { ...process.env, DISPLAY: ':99' },
   });
 
-  await recorder.start('./output.mp4');
+  await sleep(2500); // warm-up
 
-  try {
-    if (events && events.length) {
+  // 6. Replay the movements
+  try{
+    if(events && events.length){
       await replayEvents(page, events);
     } else {
       await scriptedTour(page);
     }
-  } catch (err) {
-    console.error('Tour error:', err);
+  }catch(e){
+    console.error('Replay error:', e);
   }
 
-  // Give the last frame a moment before stopping
-  await new Promise(r => setTimeout(r, 1200));
+  await sleep(1500);
 
-  console.log('Stopping recorder…');
-  await recorder.stop();
+  // 7. Stop ffmpeg gracefully
+  console.log('Stopping ffmpeg…');
+  ffmpeg.stdin.write('q');
+  await new Promise(r => ffmpeg.on('exit', r));
+
+  // 8. Cleanup
   await browser.close();
   server.close();
 
-  const size = fs.statSync('./output.mp4').size;
-  console.log(`✓ output.mp4 generated — ${(size / 1048576).toFixed(1)} MB`);
+  const size = fs.statSync('output.mp4').size;
+  console.log('✓ output.mp4 generated — ' + (size / 1048576).toFixed(1) + ' MB');
 }
 
-/* ──────────────────────────────────────────────────────────
-   SCRIPTED TOUR — used when there's no events.json.
-   Plays a clean, predictable demo of the app.
-   ────────────────────────────────────────────────────────── */
-async function scriptedTour(page) {
-  console.log('Running scripted tour…');
-
-  // 1. Hold on the top of the dashboard
-  await sleep(2000);
-
-  // 2. Slow scroll all the way down (shows the whole app)
-  await smoothScroll(page, 'down', 6000);
-  await sleep(800);
-
-  // 3. Scroll back to top
-  await smoothScroll(page, 'up', 3000);
-  await sleep(500);
-
-  // 4. Open the AI Report
-  await safeClick(page, '.ai-report-btn');
-  await sleep(6500); // loading animation + reveal
-
-  // 5. Close it
-  await safeClick(page, '.mcls');
-  await sleep(700);
-
-  // 6. Open My Hold
-  await safeClick(page, '.bhold');
-  await sleep(2500);
-  await safeClick(page, '.mcls');
-  await sleep(700);
-
-  // 7. Open PW Schedule
-  await safeClick(page, '.bpw');
-  await sleep(2500);
-  await safeClick(page, '.mcls');
-  await sleep(700);
-
-  // 8. Open Profile
-  await safeClick(page, '.btn.bp:not(.ai-report-btn)'); // fallback
-  await sleep(2500);
-
-  // 9. Hold on the final frame
-  await sleep(1500);
-}
-
-/* Smooth scrolling that looks natural on video */
-async function smoothScroll(page, direction, durationMs) {
-  await page.evaluate(async (dir, dur) => {
-    const max = document.body.scrollHeight - window.innerHeight;
-    const start = window.scrollY;
-    const end = dir === 'down' ? max : 0;
-    const steps = Math.max(40, Math.round(dur / 25));
-    const dt = dur / steps;
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      // ease in-out
-      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      window.scrollTo(0, start + (end - start) * e);
-      await new Promise(r => setTimeout(r, dt));
-    }
-  }, direction, durationMs);
-}
-
-async function safeClick(page, selector) {
-  try {
-    await page.waitForSelector(selector, { timeout: 2000 });
-    await page.click(selector);
-  } catch (e) {
-    console.log(`(skip) could not click ${selector}`);
-  }
-}
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-/* ──────────────────────────────────────────────────────────
-   EVENT REPLAY — used when events.json is present.
-   Replays your actual scrolls, taps and clicks at the original
-   timestamps, in the original order.
-   ────────────────────────────────────────────────────────── */
-async function replayEvents(page, events) {
-  console.log('Replaying recorded events…');
+/* ──────────────────────────────────────────────────────
+   REPLAY: uses your recorded events.json
+   Puppeteer handles DOM-level actions (scroll, click on
+   elements by selector, input). xdotool moves the real X
+   cursor so it appears in the ffmpeg recording.
+   ────────────────────────────────────────────────────── */
+async function replayEvents(page, events){
+  console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
+  const t0 = Date.now();
 
-  const start = Date.now();
+  for(const ev of events){
+    const wait = ev.t - (Date.now() - t0);
+    if(wait > 0) await sleep(wait);
 
-  for (const ev of events) {
-    const wait = ev.t - (Date.now() - start);
-    if (wait > 0) await sleep(wait);
-
-    try {
-      if (ev.type === 'scroll') {
-        await page.evaluate(top => window.scrollTo(0, top), ev.top || 0);
-      } else if (ev.type === 'click') {
-        if (ev.x != null && ev.y != null) {
+    try{
+      if(ev.type === 'scroll'){
+        if(ev.target === 'html' || !ev.target){
+          await page.evaluate(top => window.scrollTo(0, top), ev.top || 0);
+        } else {
+          await page.evaluate((sel, top) => {
+            const el = document.querySelector(sel);
+            if(el) el.scrollTop = top;
+          }, ev.target, ev.top || 0);
+        }
+      } else if(ev.type === 'click'){
+        if(ev.x != null && ev.y != null){
+          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          await sleep(30);
           await page.mouse.click(ev.x, ev.y);
-        } else if (ev.target) {
+        } else if(ev.target){
           await page.evaluate(sel => {
             const el = document.querySelector(sel);
-            if (el) {
-              el.scrollIntoView({ block: 'center' });
-              el.click();
-            }
+            if(el){ el.scrollIntoView({ block: 'center' }); el.click(); }
           }, ev.target);
         }
-      } else if (ev.type === 'move') {
-        if (ev.x != null && ev.y != null) {
-          await page.mouse.move(ev.x, ev.y);
+      } else if(ev.type === 'move'){
+        if(ev.x != null && ev.y != null){
+          await xdo('mousemove ' + ev.x + ' ' + ev.y);
         }
-      } else if (ev.type === 'input') {
+      } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
           const el = document.querySelector(sel);
-          if (el) {
+          if(el){
             el.value = val;
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
           }
         }, ev.target, ev.value);
       }
-    } catch (e) {
-      console.log(`(skip event ${ev.type}): ${e.message}`);
+    }catch(e){
+      console.log('skip event ' + ev.type + ': ' + e.message);
     }
   }
+  console.log('Replay complete');
+}
+
+/* ──────────────────────────────────────────────────────
+   SCRIPTED TOUR: used only if events.json is absent
+   ────────────────────────────────────────────────────── */
+async function scriptedTour(page){
+  console.log('Running scripted tour…');
+  await sleep(2000);
+
+  // Slow scroll down
+  await page.evaluate(async () => {
+    const max = document.body.scrollHeight - window.innerHeight;
+    const steps = 200, dt = 30;
+    for(let i = 0; i <= steps; i++){
+      const t = i / steps;
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      window.scrollTo(0, max * e);
+      await new Promise(r => setTimeout(r, dt));
+    }
+  });
+  await sleep(1000);
+
+  // Back to top
+  await page.evaluate(async () => {
+    const start = window.scrollY;
+    const steps = 150, dt = 25;
+    for(let i = 0; i <= steps; i++){
+      const t = i / steps;
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      window.scrollTo(0, start * (1 - e));
+      await new Promise(r => setTimeout(r, dt));
+    }
+  });
+  await sleep(500);
+
+  const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
+
+  // AI Report
+  await click('.ai-report-btn');
+  await sleep(7000);
+  await click('.mcls');
+  await sleep(800);
+
+  // My Hold
+  await click('.bhold');
+  await sleep(3000);
+  await click('.mcls');
+  await sleep(800);
+
+  // PW Schedule
+  await click('.bpw');
+  await sleep(3000);
+
+  await sleep(1500);
 }
 
 main().catch(err => {
