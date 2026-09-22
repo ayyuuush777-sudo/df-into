@@ -5,19 +5,19 @@ const path = require('path');
 const { spawn, exec } = require('child_process');
 
 // ── Viewport: phone-shaped, below your app's 1100px breakpoint ──
-const VIEW_W = 800;        // CSS px — below 1100, so stacked/phone layout
+const VIEW_W = 800;         // CSS px
 const VIEW_H = 450;         // 16:9
-const DPR = 3.2;           // 1000 × 2.56 = 2560 CSS-px × DPR = physical
-// Output
-const OUT_W = Math.round(VIEW_W * DPR);  // 2560
-const OUT_H = Math.round(VIEW_H * DPR);  // 1440
+const DPR = 3.2;            // 800 × 3.2 = 2560, 450 × 3.2 = 1440
+const OUT_W = Math.round(VIEW_W * DPR);   // 2560
+const OUT_H = Math.round(VIEW_H * DPR);   // 1440
 const FPS = 60;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function xdo(args){
   return new Promise(resolve => {
-    exec('xdotool ' + args, { env: { ...process.env, DISPLAY: ':99' } }, () => resolve());
+    exec('xdotool ' + args, { env: { ...process.env, DISPLAY: ':99' } },
+      (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
 }
 
@@ -57,7 +57,6 @@ async function main(){
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      // Window matches Xvfb screen exactly
       '--window-size=' + OUT_W + ',' + OUT_H,
       '--window-position=0,0',
       '--kiosk',
@@ -76,8 +75,6 @@ async function main(){
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
 
-  // Puppeteer's setViewport overrides Chrome's own layout viewport
-  // reliable way to guarantee the CSS width is what we want
   await page.setViewport({
     width: VIEW_W,
     height: VIEW_H,
@@ -120,6 +117,43 @@ async function main(){
   console.log('▶ App .shell width: ' + diag.shellW + ' CSS px');
   console.log('▶ Output: ' + (diag.innerW * diag.dpr) + 'x' + (diag.innerH * diag.dpr) + ' physical');
 
+  // ── FORCE WINDOW TO 0,0 ──
+  // Without a window manager on the GitHub runner, Chrome ignores
+  // --window-position and places itself wherever it wants. The result is a
+  // white strip of unfilled Xvfb background above the actual page.
+  // xdotool talks directly to the X server and bypasses the (missing) WM.
+  console.log('▶ Forcing Chrome window to top-left…');
+
+  // Find candidate windows
+  const searchRes = await xdo('search --onlyvisible --name ""');
+  const winIds = (searchRes.stdout || '').trim().split('\n').filter(Boolean);
+  console.log('  visible windows: ' + winIds.length);
+
+  // Pick the largest window (the actual Chrome content window, not a helper)
+  let bestId = null, bestArea = 0;
+  for(const id of winIds){
+    const g = await xdo('getwindowgeometry ' + id);
+    const m = (g.stdout || '').match(/Geometry:\s*(\d+)x(\d+)/);
+    if(m){
+      const area = parseInt(m[1]) * parseInt(m[2]);
+      if(area > bestArea){ bestArea = area; bestId = id; }
+    }
+  }
+
+  if(bestId){
+    console.log('  using window id ' + bestId + ' (' + bestArea + 'px area)');
+    await xdo('windowmove ' + bestId + ' 0 0');
+    await xdo('windowsize ' + bestId + ' ' + OUT_W + ' ' + OUT_H);
+    await xdo('windowraise ' + bestId);
+    await sleep(800);
+
+    const verify = await xdo('getwindowgeometry ' + bestId);
+    console.log('▶ Window geometry after move:');
+    console.log((verify.stdout || '').trim());
+  } else {
+    console.log('  no Chrome window found — relying on --window-position flag');
+  }
+
   console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
@@ -153,9 +187,14 @@ async function main(){
   }catch(e){ console.error('Replay error:', e); }
 
   await sleep(1500);
-  console.log('Stopping ffmpeg…');
-  ffmpeg.stdin.write('q');
-  await new Promise(r => ffmpeg.on('exit', r));
+
+  if(ffmpeg.exitCode === null){
+    console.log('Stopping ffmpeg…');
+    try { ffmpeg.stdin.write('q'); } catch(e){}
+    await new Promise(r => ffmpeg.on('exit', r));
+  } else {
+    console.log('ffmpeg already exited with code ' + ffmpeg.exitCode);
+  }
 
   await browser.close();
   server.close();
