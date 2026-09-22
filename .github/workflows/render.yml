@@ -36,7 +36,7 @@ jobs:
 
       - name: Render
         run: |
-          Xvfb :99 -screen 0 3840x2160x24 -ac +extension GLX +render -noreset &
+          Xvfb :99 -screen 0 2560x1440x24 -ac +extension GLX +render -noreset &
           sleep 3
           export DISPLAY=:99
           node render.js
