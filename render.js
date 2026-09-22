@@ -4,10 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-// CSS layout size (what the app "thinks" the screen is)
 const LAYOUT_W = 1920;
 const LAYOUT_H = 1080;
-// Physical pixel size (what ffmpeg captures) — 2x density
 const OUT_W = 3840;
 const OUT_H = 2160;
 const SCALE = 2;
@@ -23,9 +21,7 @@ function xdo(args){
 
 async function main(){
   const htmlPath = path.join(__dirname, 'study-planner.html');
-  if(!fs.existsSync(htmlPath)){
-    throw new Error('study-planner.html not found in repo root');
-  }
+  if(!fs.existsSync(htmlPath)) throw new Error('study-planner.html not found');
   const html = fs.readFileSync(htmlPath, 'utf8');
   console.log('Loaded study-planner.html (' + html.length + ' bytes)');
 
@@ -36,9 +32,7 @@ async function main(){
       events = JSON.parse(fs.readFileSync(evPath, 'utf8'));
       if(!Array.isArray(events)) events = null;
       else console.log('Found events.json — ' + events.length + ' events');
-    }catch(e){
-      console.log('events.json parse error, using scripted tour');
-    }
+    }catch(e){ console.log('events.json parse error'); }
   }
   if(!events) console.log('No events.json — using scripted tour');
 
@@ -48,10 +42,9 @@ async function main(){
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
-  console.log('Server listening on ' + port);
+  console.log('Server on ' + port);
 
-  console.log('Launching Chrome — layout ' + LAYOUT_W + 'x' + LAYOUT_H +
-              ', output ' + OUT_W + 'x' + OUT_H);
+  console.log('Launching Chrome (no kiosk, sized to full Xvfb screen)…');
   const browser = await puppeteer.launch({
     executablePath: '/usr/bin/google-chrome-stable',
     headless: false,
@@ -61,9 +54,10 @@ async function main(){
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu-sandbox',
-      '--window-size=' + LAYOUT_W + ',' + LAYOUT_H,
+      // Window matches the FULL Xvfb screen — this is critical.
+      // No kiosk, no window-size fighting the display size.
+      '--window-size=' + OUT_W + ',' + OUT_H,
       '--window-position=0,0',
-      '--kiosk',
       '--force-device-scale-factor=' + SCALE,
       '--no-first-run',
       '--no-default-browser-check',
@@ -72,11 +66,15 @@ async function main(){
       '--disable-features=Translate,ChromeWhatsNewUI,MediaRouter',
       '--disable-component-update',
       '--disable-background-networking',
+      '--start-maximized',
     ],
   });
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
+
+  // Puppeteer's viewport override is the reliable one — it talks to
+  // Chrome DevTools Protocol directly, unlike the launch flag.
   await page.setViewport({
     width: LAYOUT_W,
     height: LAYOUT_H,
@@ -109,7 +107,25 @@ async function main(){
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
   await sleep(5000);
 
-  console.log('Starting ffmpeg at ' + OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps…');
+  // ── DIAGNOSTIC: print what Chrome thinks the viewport is ──
+  const diag = await page.evaluate(() => ({
+    innerW: window.innerWidth,
+    innerH: window.innerHeight,
+    dpr: window.devicePixelRatio,
+    physicalW: window.innerWidth * window.devicePixelRatio,
+    physicalH: window.innerHeight * window.devicePixelRatio,
+  }));
+  console.log('▶ Chrome viewport: ' + diag.innerW + 'x' + diag.innerH +
+              ' CSS px @ DPR ' + diag.dpr +
+              ' = ' + diag.physicalW + 'x' + diag.physicalH + ' physical px');
+  console.log('▶ Expected: ' + LAYOUT_W + 'x' + LAYOUT_H + ' @ ' + SCALE +
+              ' = ' + OUT_W + 'x' + OUT_H);
+  if(diag.dpr !== SCALE){
+    console.log('⚠ WARNING: DPR is ' + diag.dpr + ' not ' + SCALE +
+                ' — the video will NOT be true 4K');
+  }
+
+  console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
     '-f', 'x11grab',
@@ -136,15 +152,9 @@ async function main(){
   await sleep(3000);
 
   try{
-    if(events && events.length){
-      // xdotool needs the physical pixel coords — scale up the recorded coords
-      await replayEvents(page, events);
-    } else {
-      await scriptedTour(page);
-    }
-  }catch(e){
-    console.error('Replay error:', e);
-  }
+    if(events && events.length) await replayEvents(page, events);
+    else await scriptedTour(page);
+  }catch(e){ console.error('Replay error:', e); }
 
   await sleep(1500);
 
@@ -156,34 +166,30 @@ async function main(){
   server.close();
 
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' + OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps');
+  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' +
+              OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps');
 }
 
 async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
-
   for(const ev of events){
     const wait = ev.t - (Date.now() - t0);
     if(wait > 0) await sleep(wait);
-
     try{
       if(ev.type === 'scroll'){
         if(ev.target === 'html' || !ev.target){
           await page.evaluate(top => window.scrollTo(0, top), ev.top || 0);
         } else {
           await page.evaluate((sel, top) => {
-            const el = document.querySelector(sel);
-            if(el) el.scrollTop = top;
+            const el = document.querySelector(sel); if(el) el.scrollTop = top;
           }, ev.target, ev.top || 0);
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          // Physical pixel coords for xdotool (cursor overlay)
           await xdo('mousemove ' + (ev.x * SCALE) + ' ' + (ev.y * SCALE));
           await sleep(30);
-          // Puppeteer clicks in CSS pixel coords (layout space)
           await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
           await page.evaluate(sel => {
@@ -205,60 +211,40 @@ async function replayEvents(page, events){
           }
         }, ev.target, ev.value);
       }
-    }catch(e){
-      console.log('skip event ' + ev.type + ': ' + e.message);
-    }
+    }catch(e){ console.log('skip ' + ev.type + ': ' + e.message); }
   }
-  console.log('Replay complete');
 }
 
 async function scriptedTour(page){
-  console.log('Running scripted tour…');
+  console.log('Scripted tour…');
   await sleep(2500);
-
   await page.evaluate(async () => {
     const max = document.body.scrollHeight - window.innerHeight;
-    const steps = 200, dt = 30;
-    for(let i = 0; i <= steps; i++){
-      const t = i / steps;
-      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    for(let i = 0; i <= 200; i++){
+      const t = i / 200;
+      const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;
       window.scrollTo(0, max * e);
-      await new Promise(r => setTimeout(r, dt));
+      await new Promise(r => setTimeout(r, 30));
     }
   });
   await sleep(1200);
-
   await page.evaluate(async () => {
     const start = window.scrollY;
-    const steps = 150, dt = 25;
-    for(let i = 0; i <= steps; i++){
-      const t = i / steps;
-      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    for(let i = 0; i <= 150; i++){
+      const t = i / 150;
+      const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;
       window.scrollTo(0, start * (1 - e));
-      await new Promise(r => setTimeout(r, dt));
+      await new Promise(r => setTimeout(r, 25));
     }
   });
   await sleep(700);
-
   const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
-
-  await click('.ai-report-btn');
-  await sleep(7500);
-  await click('.mcls');
-  await sleep(900);
-
-  await click('.bhold');
-  await sleep(3200);
-  await click('.mcls');
-  await sleep(900);
-
-  await click('.bpw');
-  await sleep(3200);
-
+  await click('.ai-report-btn'); await sleep(7500);
+  await click('.mcls'); await sleep(900);
+  await click('.bhold'); await sleep(3200);
+  await click('.mcls'); await sleep(900);
+  await click('.bpw'); await sleep(3200);
   await sleep(1500);
 }
 
-main().catch(err => {
-  console.error('FATAL:', err);
-  process.exit(1);
-});
+main().catch(err => { console.error('FATAL:', err); process.exit(1); });
