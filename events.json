@@ -1,0 +1,152 @@
+[
+  {
+    "t": 1595,
+    "type": "move",
+    "x": 1562,
+    "y": 535
+  },
+  {
+    "t": 1599,
+    "type": "click",
+    "target": "#todaytasks > div:nth-of-type(2) > button.btn:nth-of-type(1)",
+    "x": 1562,
+    "y": 535
+  },
+  {
+    "t": 4743,
+    "type": "move",
+    "x": 1084,
+    "y": 41
+  },
+  {
+    "t": 4746,
+    "type": "click",
+    "target": "div.shell:nth-of-type(16) > div.topbar:nth-of-type(1) > div.acts:nth-of-type(3) > button.btn.ai-report-btn:nth-of-type(1)",
+    "x": 1084,
+    "y": 41
+  },
+  {
+    "t": 7166,
+    "type": "move",
+    "x": 1154,
+    "y": 664
+  },
+  {
+    "t": 7212,
+    "type": "scroll",
+    "target": "#day-summary-content",
+    "top": 106.66666412353516
+  },
+  {
+    "t": 7268,
+    "type": "move",
+    "x": 1269,
+    "y": 452
+  },
+  {
+    "t": 7386,
+    "type": "scroll",
+    "target": "#day-summary-content",
+    "top": 295.3333435058594
+  },
+  {
+    "t": 9205,
+    "type": "move",
+    "x": 753,
+    "y": 941
+  },
+  {
+    "t": 9209,
+    "type": "click",
+    "target": "#mDaySummary > div.modal.wide > div:nth-of-type(4) > button.btn:nth-of-type(1)",
+    "x": 753,
+    "y": 941
+  },
+  {
+    "t": 11293,
+    "type": "move",
+    "x": 1533,
+    "y": 53
+  },
+  {
+    "t": 11295,
+    "type": "click",
+    "target": "div.shell:nth-of-type(16) > div.topbar:nth-of-type(1) > div.acts:nth-of-type(3) > button.btn:nth-of-type(5)",
+    "x": 1533,
+    "y": 53
+  },
+  {
+    "t": 12814,
+    "type": "move",
+    "x": 1190,
+    "y": 675
+  },
+  {
+    "t": 12845,
+    "type": "scroll",
+    "target": "#profile-content",
+    "top": 74.66666412353516
+  },
+  {
+    "t": 12912,
+    "type": "move",
+    "x": 1495,
+    "y": 202
+  },
+  {
+    "t": 13274,
+    "type": "scroll",
+    "target": "#profile-content",
+    "top": 1791.3333740234375
+  },
+  {
+    "t": 15571,
+    "type": "move",
+    "x": 1274,
+    "y": 479
+  },
+  {
+    "t": 15591,
+    "type": "scroll",
+    "target": "#profile-content",
+    "top": 1664.6666259765625
+  },
+  {
+    "t": 15639,
+    "type": "move",
+    "x": 1260,
+    "y": 935
+  },
+  {
+    "t": 15783,
+    "type": "scroll",
+    "target": "#profile-content",
+    "top": 0
+  },
+  {
+    "t": 17275,
+    "type": "move",
+    "x": 1375,
+    "y": 107
+  },
+  {
+    "t": 17280,
+    "type": "click",
+    "target": "#mProfile > div.modal.wide > div.mhdr:nth-of-type(1)",
+    "x": 1375,
+    "y": 107
+  },
+  {
+    "t": 18360,
+    "type": "move",
+    "x": 1400,
+    "y": 106
+  },
+  {
+    "t": 18362,
+    "type": "click",
+    "target": "#mProfile > div.modal.wide > div.mhdr:nth-of-type(1) > button.mcls",
+    "x": 1400,
+    "y": 106
+  }
+]

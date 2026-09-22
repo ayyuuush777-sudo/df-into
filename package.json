@@ -1,0 +1,12 @@
+{
+  "name": "apex-render",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render": "node render.js"
+  },
+  "dependencies": {
+    "puppeteer": "23.11.1",
+    "puppeteer-screen-recorder": "3.0.6"
+  }
+}
