@@ -128,6 +128,7 @@ async function main(){
     '-video_size', OUT_W + 'x' + OUT_H,
     '-draw_mouse', '1',
     '-i', ':99',
+    '-vf', 'crop=' + OUT_W + ':' + OUT_H + ':0:0',
     '-c:v', 'libx264',
     '-preset', 'slow',
     '-crf', '12',
