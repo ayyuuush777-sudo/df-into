@@ -35,7 +35,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 .a3{width:600px;height:600px;background:#34d399;top:35%;left:46%;transform:translate(-50%,-50%);opacity:.03}
 .a4{width:550px;height:550px;background:#c084fc;top:62%;right:-180px;opacity:.035}
 /* SHELL */
-.shell{position:relative;z-index:1;max-width:1480px;margin:0 auto;padding:20px 26px 44px}
+.shell{position:relative;z-index:1;max-width:100%;margin:0 auto;padding:24px 40px 48px}
 /* REWARD STRIP */
 .reward-strip{display:flex;align-items:center;gap:14px;margin-bottom:18px;padding:10px 18px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);position:relative;overflow:hidden}
 .reward-strip::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--aglow),transparent)}
@@ -97,7 +97,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 .spill-ico{position:absolute;top:11px;right:12px;opacity:.09;transition:opacity var(--tr);font-size:1.4rem}
 .spill:hover .spill-ico{opacity:.2}
 /* CARDS */
-.mgrid{display:grid;grid-template-columns:385px 1fr;gap:16px}
+.mgrid{display:grid;grid-template-columns:500px 1fr;gap:16px}
 @media(max-width:1100px){.mgrid{grid-template-columns:1fr}}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:19px 21px;box-shadow:var(--sh);position:relative;overflow:hidden;transition:border-color var(--tr)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(79,142,247,.18),transparent)}
