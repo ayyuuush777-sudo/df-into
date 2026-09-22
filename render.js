@@ -4,9 +4,13 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-// Both Xvfb and Chrome use this exact size. No scaling.
-const W = 2560;
-const H = 1440;
+// ── Viewport: phone-shaped, below your app's 1100px breakpoint ──
+const VIEW_W = 1000;        // CSS px — below 1100, so stacked/phone layout
+const VIEW_H = 562;         // 16:9
+const DPR = 2.56;           // 1000 × 2.56 = 2560 CSS-px × DPR = physical
+// Output
+const OUT_W = Math.round(VIEW_W * DPR);  // 2560
+const OUT_H = Math.round(VIEW_H * DPR);  // 1440
 const FPS = 60;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -42,7 +46,9 @@ async function main(){
   const port = server.address().port;
   console.log('Server on ' + port);
 
-  console.log('Launching Chrome at native ' + W + 'x' + H + ' (DPR 1, no scaling)…');
+  console.log('Layout: ' + VIEW_W + 'x' + VIEW_H + ' CSS px @ DPR ' + DPR +
+              ' → ' + OUT_W + 'x' + OUT_H + ' physical');
+
   const browser = await puppeteer.launch({
     executablePath: '/usr/bin/google-chrome-stable',
     headless: false,
@@ -51,30 +57,31 @@ async function main(){
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--window-size=' + W + ',' + H,
+      // Window matches Xvfb screen exactly
+      '--window-size=' + OUT_W + ',' + OUT_H,
       '--window-position=0,0',
-      '--force-device-scale-factor=1',
+      '--kiosk',
+      '--force-device-scale-factor=' + DPR,
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-infobars',
       '--hide-scrollbars',
+      '--font-render-hinting=medium',
       '--disable-features=Translate,ChromeWhatsNewUI,MediaRouter',
       '--disable-component-update',
       '--disable-background-networking',
-      '--start-maximized',
-      // Font rendering: use full subpixel AA, no hinting tricks
-      '--font-render-hinting=medium',
-      '--enable-font-antialiasing',
-      '--disable-lcd-text=false',
     ],
   });
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
+
+  // Puppeteer's setViewport overrides Chrome's own layout viewport
+  // reliable way to guarantee the CSS width is what we want
   await page.setViewport({
-    width: W,
-    height: H,
-    deviceScaleFactor: 1,
+    width: VIEW_W,
+    height: VIEW_H,
+    deviceScaleFactor: DPR,
   });
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
@@ -107,17 +114,18 @@ async function main(){
     innerW: window.innerWidth,
     innerH: window.innerHeight,
     dpr: window.devicePixelRatio,
+    shellW: (() => { const s = document.querySelector('.shell'); return s ? Math.round(s.getBoundingClientRect().width) : null; })(),
   }));
   console.log('▶ Viewport: ' + diag.innerW + 'x' + diag.innerH + ' CSS @ DPR ' + diag.dpr);
-  console.log('▶ Native render: ' + (diag.innerW * diag.dpr) + 'x' + (diag.innerH * diag.dpr) + ' physical px');
-  console.log('▶ Expected: ' + W + 'x' + H + ' — should match above');
+  console.log('▶ App .shell width: ' + diag.shellW + ' CSS px');
+  console.log('▶ Output: ' + (diag.innerW * diag.dpr) + 'x' + (diag.innerH * diag.dpr) + ' physical');
 
-  console.log('Starting ffmpeg (native, no scaling)…');
+  console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
     '-f', 'x11grab',
     '-framerate', String(FPS),
-    '-video_size', W + 'x' + H,
+    '-video_size', OUT_W + 'x' + OUT_H,
     '-draw_mouse', '1',
     '-i', ':99',
     '-c:v', 'libx264',
@@ -151,7 +159,7 @@ async function main(){
   await browser.close();
   server.close();
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' + W + 'x' + H + ' @ ' + FPS + 'fps');
+  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' + OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps');
 }
 
 async function replayEvents(page, events){
@@ -172,7 +180,7 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + ev.x + ' ' + ev.y);
+          await xdo('mousemove ' + Math.round(ev.x * DPR) + ' ' + Math.round(ev.y * DPR));
           await sleep(30);
           await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
@@ -182,7 +190,9 @@ async function replayEvents(page, events){
           }, ev.target);
         }
       } else if(ev.type === 'move'){
-        if(ev.x != null && ev.y != null) await xdo('mousemove ' + ev.x + ' ' + ev.y);
+        if(ev.x != null && ev.y != null){
+          await xdo('mousemove ' + Math.round(ev.x * DPR) + ' ' + Math.round(ev.y * DPR));
+        }
       } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
           const el = document.querySelector(sel);
