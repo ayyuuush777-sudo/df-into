@@ -4,9 +4,22 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
+/* ─── OUTPUT SETTINGS ────────────────────────────────────
+   W/H determine the ffmpeg capture window. Both Xvfb (in the
+   workflow) and Chrome (below) must match.
+   1920x1080 = 16:9 landscape, the standard YouTube upload.
+   ──────────────────────────────────────────────────────── */
 const W = 1920;
 const H = 1080;
 const FPS = 60;
+
+/* ─── QUALITY SETTINGS ───────────────────────────────────
+   CRF:  0–51, lower = higher quality. 14 is visually lossless.
+         YouTube re-encodes anyway, so going below 14 is wasted.
+   preset: ultrafast → fast → medium → slow → veryslow.
+         slower = better compression at same quality, at the cost
+         of CPU time. 'medium' is the sweet spot.
+   ──────────────────────────────────────────────────────── */
 const CRF = 14;
 const PRESET = 'medium';
 
@@ -18,21 +31,13 @@ function xdo(args){
   });
 }
 
-/* Fill the full recording frame — injected at render time only,
-   your study-planner.html file is untouched. */
-const FILL_STYLES = `
-  html, body { width: 100% !important; max-width: none !important; overflow-x: hidden !important; }
-  .shell { max-width: none !important; width: 100% !important; padding-left: 40px !important; padding-right: 40px !important; }
-  [style*="max-width"] { max-width: none !important; }
-  .amb { display: none !important; }
-`;
-
 async function main(){
   const htmlPath = path.join(__dirname, 'study-planner.html');
-  if(!fs.existsSync(htmlPath)) throw new Error('study-planner.html not found');
+  if(!fs.existsSync(htmlPath)){
+    throw new Error('study-planner.html not found in repo root');
+  }
   const html = fs.readFileSync(htmlPath, 'utf8');
-  console.log('Loaded HTML (' + html.length + ' bytes)');
-  console.log('Target: ' + W + 'x' + H + ' @ ' + FPS + 'fps · CRF ' + CRF);
+  console.log('Loaded study-planner.html (' + html.length + ' bytes)');
 
   let events = null;
   const evPath = path.join(__dirname, 'events.json');
@@ -40,10 +45,12 @@ async function main(){
     try{
       events = JSON.parse(fs.readFileSync(evPath, 'utf8'));
       if(!Array.isArray(events)) events = null;
-      else console.log('events.json — ' + events.length + ' events');
-    }catch(e){}
+      else console.log('Found events.json — ' + events.length + ' events');
+    }catch(e){
+      console.log('events.json parse error, using scripted tour');
+    }
   }
-  if(!events) console.log('No events.json — scripted tour');
+  if(!events) console.log('No events.json — using scripted tour');
 
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -51,6 +58,7 @@ async function main(){
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
+  console.log('Server listening on ' + port);
 
   console.log('Launching Chrome…');
   const browser = await puppeteer.launch({
@@ -64,7 +72,7 @@ async function main(){
       '--disable-gpu-sandbox',
       '--window-size=' + W + ',' + H,
       '--window-position=0,0',
-      '--start-maximized',
+      '--kiosk',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-infobars',
@@ -78,20 +86,6 @@ async function main(){
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
-
-  try{
-    const winId = await new Promise(res => {
-      exec("xdotool search --onlyvisible --class 'google-chrome' | head -n1",
-        { env: { ...process.env, DISPLAY: ':99' } },
-        (err, stdout) => res(stdout.trim())
-      );
-    });
-    if(winId){
-      await xdo('windowsize ' + winId + ' ' + W + ' ' + H);
-      await xdo('windowmove ' + winId + ' 0 0');
-    }
-  }catch(e){}
-
   await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
@@ -118,27 +112,30 @@ async function main(){
   });
 
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
-  await page.addStyleTag({ content: FILL_STYLES });
   await sleep(3500);
 
-  const vp = await page.evaluate(() => ({
-    w: window.innerWidth,
-    h: window.innerHeight,
-    shellW: document.querySelector('.shell') ? document.querySelector('.shell').offsetWidth : null,
-  }));
-  console.log('Viewport: ' + vp.w + 'x' + vp.h + ' · .shell width: ' + vp.shellW);
-
-  console.log('Starting ffmpeg…');
+  /* ─── FFMPEG CAPTURE ─────────────────────────────────────
+     Records the Xvfb virtual display at WxH @ FPS, encodes with
+     libx264 at high-quality CRF, adds a silent AAC track so the
+     MP4 is universally playable, tags BT.709 colors, and sets
+     the standard H.264 profile YouTube expects.
+     ──────────────────────────────────────────────────────── */
+  console.log('Starting ffmpeg (CRF ' + CRF + ', preset ' + PRESET + ')…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
+
+    // Video input: the Xvfb display
     '-f', 'x11grab',
     '-framerate', String(FPS),
     '-video_size', W + 'x' + H,
     '-draw_mouse', '1',
     '-i', ':99',
+
+    // Silent stereo audio input
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-    '-vf', 'scale=' + W + ':' + H + ':force_original_aspect_ratio=decrease,pad=' + W + ':' + H + ':(ow-iw)/2:(oh-ih)/2:color=black,setsar=1',
+
+    // Video codec + quality
     '-c:v', 'libx264',
     '-preset', PRESET,
     '-crf', String(CRF),
@@ -147,17 +144,26 @@ async function main(){
     '-level', '4.2',
     '-maxrate', '30M',
     '-bufsize', '60M',
-    '-g', String(FPS * 2),
+    '-g', String(FPS * 2),   // keyframe every 2s → smooth seeking
     '-r', String(FPS),
+
+    // Correct color metadata
     '-colorspace', 'bt709',
     '-color_primaries', 'bt709',
     '-color_trc', 'bt709',
+
+    // Audio codec
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
     '-ac', '2',
+
+    // Stop when the video stream ends
     '-shortest',
+
+    // Fast-start for web/YouTube (moov atom at front)
     '-movflags', '+faststart',
+
     'output.mp4',
   ], {
     stdio: ['pipe', 'inherit', 'inherit'],
@@ -167,9 +173,14 @@ async function main(){
   await sleep(2500);
 
   try{
-    if(events && events.length) await replayEvents(page, events);
-    else await scriptedTour(page);
-  }catch(e){ console.error('Replay error:', e); }
+    if(events && events.length){
+      await replayEvents(page, events);
+    } else {
+      await scriptedTour(page);
+    }
+  }catch(e){
+    console.error('Replay error:', e);
+  }
 
   await sleep(1500);
 
@@ -181,7 +192,7 @@ async function main(){
   server.close();
 
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB');
+  console.log('✓ output.mp4 generated — ' + (size / 1048576).toFixed(1) + ' MB');
 }
 
 async function replayEvents(page, events){
@@ -189,7 +200,6 @@ async function replayEvents(page, events){
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
 
-  // No scaling — render is 1920x1080, same as where events were recorded
   for(const ev of events){
     const wait = ev.t - (Date.now() - t0);
     if(wait > 0) await sleep(wait);
@@ -229,14 +239,17 @@ async function replayEvents(page, events){
           }
         }, ev.target, ev.value);
       }
-    }catch(e){ console.log('skip ' + ev.type + ': ' + e.message); }
+    }catch(e){
+      console.log('skip event ' + ev.type + ': ' + e.message);
+    }
   }
   console.log('Replay complete');
 }
 
 async function scriptedTour(page){
-  console.log('Scripted tour…');
+  console.log('Running scripted tour…');
   await sleep(2000);
+
   await page.evaluate(async () => {
     const max = document.body.scrollHeight - window.innerHeight;
     const steps = 200, dt = 30;
@@ -248,6 +261,7 @@ async function scriptedTour(page){
     }
   });
   await sleep(1000);
+
   await page.evaluate(async () => {
     const start = window.scrollY;
     const steps = 150, dt = 25;
@@ -259,13 +273,26 @@ async function scriptedTour(page){
     }
   });
   await sleep(500);
+
   const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
-  await click('.ai-report-btn');  await sleep(7000);
-  await click('.mcls');           await sleep(800);
-  await click('.bhold');          await sleep(3000);
-  await click('.mcls');           await sleep(800);
-  await click('.bpw');            await sleep(3000);
+
+  await click('.ai-report-btn');
+  await sleep(7000);
+  await click('.mcls');
+  await sleep(800);
+
+  await click('.bhold');
+  await sleep(3000);
+  await click('.mcls');
+  await sleep(800);
+
+  await click('.bpw');
+  await sleep(3000);
+
   await sleep(1500);
 }
 
-main().catch(err => { console.error('FATAL:', err); process.exit(1); });
+main().catch(err => {
+  console.error('FATAL:', err);
+  process.exit(1);
+});
