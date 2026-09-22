@@ -4,15 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-/* ─────────────────────────────────────────────────────────
-   OUTPUT SIZE — this is the ONLY place that defines resolution.
-   The workflow's Xvfb line must match (2560x1440x24).
-   Everything else reads from W and H.
-   ───────────────────────────────────────────────────────── */
 const W = 2560;
 const H = 1440;
 const FPS = 60;
-
 const CRF = 14;
 const PRESET = 'medium';
 
@@ -24,12 +18,38 @@ function xdo(args){
   });
 }
 
+/* ─────────────────────────────────────────────────────────
+   CSS OVERRIDE injected into the page at render time only.
+   Fixes the app's own max-width:1480px cap on .shell, plus any
+   other container that limits itself, so the app fills the full
+   recording frame edge to edge. The uploaded HTML file is NOT
+   modified — this override only exists inside the running render.
+   ───────────────────────────────────────────────────────── */
+const FILL_STYLES = `
+  html, body {
+    width: 100% !important;
+    max-width: none !important;
+    overflow-x: hidden !important;
+  }
+  .shell {
+    max-width: none !important;
+    width: 100% !important;
+    padding-left: 40px !important;
+    padding-right: 40px !important;
+  }
+  /* Kill any other element that tries to cap itself */
+  [style*="max-width"] { max-width: none !important; }
+  /* Remove the ambient glow blobs' huge blur — they render as
+     black holes in headless Chrome and pull the eye to nothing. */
+  .amb { display: none !important; }
+`;
+
 async function main(){
   const htmlPath = path.join(__dirname, 'study-planner.html');
   if(!fs.existsSync(htmlPath)) throw new Error('study-planner.html not found');
   const html = fs.readFileSync(htmlPath, 'utf8');
   console.log('Loaded HTML (' + html.length + ' bytes)');
-  console.log('Target output: ' + W + 'x' + H + ' @ ' + FPS + 'fps');
+  console.log('Target: ' + W + 'x' + H + ' @ ' + FPS + 'fps');
 
   let events = null;
   const evPath = path.join(__dirname, 'events.json');
@@ -76,37 +96,24 @@ async function main(){
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
 
-  // Force the Chrome window to fill the whole Xvfb display, since without
-  // a window manager, --window-size isn't always honored. xdotool talks
-  // straight to X11 and sets the window size deterministically.
+  // Force the OS window to fill the Xvfb display via X11 directly —
+  // headless Chrome without a window manager doesn't always honor
+  // --window-size, which left the app rendered small in past runs.
   try{
-    const winIdOut = await new Promise(res => {
+    const winId = await new Promise(res => {
       exec("xdotool search --onlyvisible --class 'google-chrome' | head -n1",
         { env: { ...process.env, DISPLAY: ':99' } },
         (err, stdout) => res(stdout.trim())
       );
     });
-    if(winIdOut){
-      await xdo('windowsize ' + winIdOut + ' ' + W + ' ' + H);
-      await xdo('windowmove ' + winIdOut + ' 0 0');
+    if(winId){
+      await xdo('windowsize ' + winId + ' ' + W + ' ' + H);
+      await xdo('windowmove ' + winId + ' 0 0');
       console.log('Chrome window forced to ' + W + 'x' + H);
-    } else {
-      console.log('Could not locate Chrome window via xdotool; relying on --window-size');
     }
-  }catch(e){ console.log('Window sizing via xdotool skipped:', e.message); }
+  }catch(e){ console.log('(window sizing via xdotool skipped)'); }
 
   await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
-
-  // Verify the actual viewport Chrome ended up with
-  const actualVP = await page.evaluate(() => ({
-    w: window.innerWidth,
-    h: window.innerHeight,
-    dpr: window.devicePixelRatio
-  }));
-  console.log('Actual viewport in browser: ' + actualVP.w + 'x' + actualVP.h + ' @ dpr ' + actualVP.dpr);
-  if(actualVP.w !== W || actualVP.h !== H){
-    console.log('⚠ Viewport differs from target — ffmpeg will still capture the full ' + W + 'x' + H + ' display');
-  }
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
 
@@ -132,30 +139,32 @@ async function main(){
   });
 
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
+
+  // Inject the fill-the-frame override.
+  await page.addStyleTag({ content: FILL_STYLES });
+  console.log('Injected full-width override');
+
   await sleep(3500);
 
-  /* ─────────────────────────────────────────────────────────
-     FFMPEG CAPTURE — 2560x1440 from Xvfb, scaled to exactly
-     WxH on output. The scale filter is what guarantees the
-     final file is exactly 2560x1440 even if the X11 display
-     or the input grabbed a slightly different size.
-     ───────────────────────────────────────────────────────── */
+  const vp = await page.evaluate(() => ({
+    w: window.innerWidth,
+    h: window.innerHeight,
+    shellW: document.querySelector('.shell') ? document.querySelector('.shell').offsetWidth : null,
+  }));
+  console.log('Viewport: ' + vp.w + 'x' + vp.h + ' · .shell width: ' + vp.shellW);
+
+  /* FFMPEG CAPTURE */
   console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
-
     '-f', 'x11grab',
     '-framerate', String(FPS),
     '-video_size', W + 'x' + H,
     '-draw_mouse', '1',
     '-i', ':99',
-
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-
-    // Force exact output resolution + square pixels
     '-vf', 'scale=' + W + ':' + H + ':force_original_aspect_ratio=decrease,pad=' + W + ':' + H + ':(ow-iw)/2:(oh-ih)/2:color=black,setsar=1',
-
     '-c:v', 'libx264',
     '-preset', PRESET,
     '-crf', String(CRF),
@@ -166,19 +175,15 @@ async function main(){
     '-bufsize', '100M',
     '-g', String(FPS * 2),
     '-r', String(FPS),
-
     '-colorspace', 'bt709',
     '-color_primaries', 'bt709',
     '-color_trc', 'bt709',
-
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
     '-ac', '2',
-
     '-shortest',
     '-movflags', '+faststart',
-
     'output.mp4',
   ], {
     stdio: ['pipe', 'inherit', 'inherit'],
@@ -203,16 +208,14 @@ async function main(){
 
   const size = fs.statSync('output.mp4').size;
   console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB');
-  console.log('   Expected resolution: ' + W + 'x' + H);
 }
 
 async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
-
-  // events.json was recorded on a viewport that was likely 1920 wide.
-  // Scale the coordinates so they land in the right spot on the 2560-wide render.
+  // events.json was recorded at 1920x1080; scale coordinates to the
+  // 2560x1440 render so clicks land on the same elements.
   const SCALE_X = W / 1920;
   const SCALE_Y = H / 1080;
 
@@ -223,9 +226,7 @@ async function replayEvents(page, events){
     try{
       if(ev.type === 'scroll'){
         if(ev.target === 'html' || !ev.target){
-          // Scale scroll distance by viewport height ratio
-          const scaledTop = (ev.top || 0) * SCALE_Y;
-          await page.evaluate(top => window.scrollTo(0, top), scaledTop);
+          await page.evaluate(top => window.scrollTo(0, top), (ev.top || 0) * SCALE_Y);
         } else {
           await page.evaluate((sel, top) => {
             const el = document.querySelector(sel);
