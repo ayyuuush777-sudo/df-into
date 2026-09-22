@@ -4,13 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-// ── Viewport: phone-shaped, below your app's 1100px breakpoint ──
-const VIEW_W = 800;         // CSS px
-const VIEW_H = 450;         // 16:9
-const DPR = 3.2;            // 800 × 3.2 = 2560, 450 × 3.2 = 1440
-const OUT_W = Math.round(VIEW_W * DPR);   // 2560
-const OUT_H = Math.round(VIEW_H * DPR);   // 1440
-const FPS = 60;
+// Layout: 800x450 CSS px @ DPR 3.2 = 2560x1440 physical output
+const VIEW_W = 800;
+const VIEW_H = 450;
+const DPR = 3.2;
+const OUT_W = 2560;
+const OUT_H = 1440;
+// 30fps — halves Chrome's CPU load, still smooth for UI demos
+const FPS = 30;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -34,7 +35,7 @@ async function main(){
       events = JSON.parse(fs.readFileSync(evPath, 'utf8'));
       if(!Array.isArray(events)) events = null;
       else console.log('Found events.json — ' + events.length + ' events');
-    }catch(e){ console.log('events.json parse error'); }
+    }catch(e){ console.log('events.json parse error: ' + e.message); }
   }
   if(!events) console.log('No events.json — scripted tour');
 
@@ -46,8 +47,8 @@ async function main(){
   const port = server.address().port;
   console.log('Server on ' + port);
 
-  console.log('Layout: ' + VIEW_W + 'x' + VIEW_H + ' CSS px @ DPR ' + DPR +
-              ' → ' + OUT_W + 'x' + OUT_H + ' physical');
+  console.log('Layout: ' + VIEW_W + 'x' + VIEW_H + ' CSS @ DPR ' + DPR +
+              ' → ' + OUT_W + 'x' + OUT_H + ' physical, ' + FPS + ' fps');
 
   const browser = await puppeteer.launch({
     executablePath: '/usr/bin/google-chrome-stable',
@@ -83,6 +84,17 @@ async function main(){
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
 
+  // Hide the giant blurred ambient blobs — they cost ~40% of render CPU
+  // and barely show up in the final video anyway.
+  await page.evaluateOnNewDocument(() => {
+    const s = document.createElement('style');
+    s.textContent = '.amb{display:none !important}';
+    const inject = () => { if(document.head) document.head.appendChild(s); };
+    if(document.head) inject();
+    else document.addEventListener('DOMContentLoaded', inject);
+  });
+
+  // localStorage shim for sandboxed contexts
   await page.evaluateOnNewDocument(() => {
     try { localStorage.setItem('_t','1'); localStorage.removeItem('_t'); }
     catch(e){
@@ -111,25 +123,16 @@ async function main(){
     innerW: window.innerWidth,
     innerH: window.innerHeight,
     dpr: window.devicePixelRatio,
-    shellW: (() => { const s = document.querySelector('.shell'); return s ? Math.round(s.getBoundingClientRect().width) : null; })(),
   }));
   console.log('▶ Viewport: ' + diag.innerW + 'x' + diag.innerH + ' CSS @ DPR ' + diag.dpr);
-  console.log('▶ App .shell width: ' + diag.shellW + ' CSS px');
   console.log('▶ Output: ' + (diag.innerW * diag.dpr) + 'x' + (diag.innerH * diag.dpr) + ' physical');
 
-  // ── FORCE WINDOW TO 0,0 ──
-  // Without a window manager on the GitHub runner, Chrome ignores
-  // --window-position and places itself wherever it wants. The result is a
-  // white strip of unfilled Xvfb background above the actual page.
-  // xdotool talks directly to the X server and bypasses the (missing) WM.
+  // ── Force Chrome window to top-left ──
   console.log('▶ Forcing Chrome window to top-left…');
-
-  // Find candidate windows
   const searchRes = await xdo('search --onlyvisible --name ""');
   const winIds = (searchRes.stdout || '').trim().split('\n').filter(Boolean);
   console.log('  visible windows: ' + winIds.length);
 
-  // Pick the largest window (the actual Chrome content window, not a helper)
   let bestId = null, bestArea = 0;
   for(const id of winIds){
     const g = await xdo('getwindowgeometry ' + id);
@@ -139,24 +142,21 @@ async function main(){
       if(area > bestArea){ bestArea = area; bestId = id; }
     }
   }
-
   if(bestId){
     console.log('  using window id ' + bestId + ' (' + bestArea + 'px area)');
     await xdo('windowmove ' + bestId + ' 0 0');
     await xdo('windowsize ' + bestId + ' ' + OUT_W + ' ' + OUT_H);
     await xdo('windowraise ' + bestId);
     await sleep(800);
-
     const verify = await xdo('getwindowgeometry ' + bestId);
-    console.log('▶ Window geometry after move:');
+    console.log('▶ Window geometry:');
     console.log((verify.stdout || '').trim());
-  } else {
-    console.log('  no Chrome window found — relying on --window-position flag');
   }
 
   console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
+    '-thread_queue_size', '1024',
     '-f', 'x11grab',
     '-framerate', String(FPS),
     '-video_size', OUT_W + 'x' + OUT_H,
@@ -164,8 +164,8 @@ async function main(){
     '-i', ':99',
     '-vf', 'crop=' + OUT_W + ':' + OUT_H + ':0:0',
     '-c:v', 'libx264',
-    '-preset', 'slow',
-    '-crf', '12',
+    '-preset', 'medium',
+    '-crf', '14',
     '-tune', 'film',
     '-pix_fmt', 'yuv420p',
     '-colorspace', 'bt709',
@@ -179,6 +179,12 @@ async function main(){
     env: { ...process.env, DISPLAY: ':99' },
   });
 
+  // Catch ffmpeg early death
+  let ffmpegDead = false;
+  ffmpeg.on('exit', code => {
+    if(code !== 0) { ffmpegDead = true; console.log('⚠ ffmpeg exited with code ' + code); }
+  });
+
   await sleep(3000);
 
   try{
@@ -188,12 +194,12 @@ async function main(){
 
   await sleep(1500);
 
-  if(ffmpeg.exitCode === null){
+  if(!ffmpegDead && ffmpeg.exitCode === null){
     console.log('Stopping ffmpeg…');
     try { ffmpeg.stdin.write('q'); } catch(e){}
     await new Promise(r => ffmpeg.on('exit', r));
   } else {
-    console.log('ffmpeg already exited with code ' + ffmpeg.exitCode);
+    console.log('ffmpeg already gone — skipping stop');
   }
 
   await browser.close();
@@ -206,9 +212,21 @@ async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
+  let lastLoggedSec = -1;
+
   for(const ev of events){
     const wait = ev.t - (Date.now() - t0);
     if(wait > 0) await sleep(wait);
+
+    // Give Chrome a couple frames to actually paint the change
+    await sleep(30);
+
+    const nowSec = Math.floor(ev.t / 1000);
+    if(nowSec !== lastLoggedSec && nowSec % 2 === 0){
+      lastLoggedSec = nowSec;
+      console.log('  t=' + nowSec + 's: ' + ev.type);
+    }
+
     try{
       if(ev.type === 'scroll'){
         if(ev.target === 'html' || !ev.target){
@@ -220,8 +238,10 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
+          // Move the real X cursor (appears in the video)
           await xdo('mousemove ' + Math.round(ev.x * DPR) + ' ' + Math.round(ev.y * DPR));
-          await sleep(30);
+          await sleep(20);
+          // Dispatch the click via CDP at CSS coords
           await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
           await page.evaluate(sel => {
@@ -243,8 +263,9 @@ async function replayEvents(page, events){
           }
         }, ev.target, ev.value);
       }
-    }catch(e){ console.log('skip ' + ev.type + ': ' + e.message); }
+    }catch(e){ console.log('  skip ' + ev.type + ': ' + e.message); }
   }
+  console.log('Replay complete');
 }
 
 async function scriptedTour(page){
