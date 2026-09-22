@@ -4,11 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-const LAYOUT_W = 1920;
-const LAYOUT_H = 1080;
-const OUT_W = 3840;
-const OUT_H = 2160;
-const SCALE = 2;
+// Both Xvfb and Chrome use this exact size. No scaling.
+const W = 2560;
+const H = 1440;
 const FPS = 60;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -34,7 +32,7 @@ async function main(){
       else console.log('Found events.json — ' + events.length + ' events');
     }catch(e){ console.log('events.json parse error'); }
   }
-  if(!events) console.log('No events.json — using scripted tour');
+  if(!events) console.log('No events.json — scripted tour');
 
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -44,7 +42,7 @@ async function main(){
   const port = server.address().port;
   console.log('Server on ' + port);
 
-  console.log('Launching Chrome (no kiosk, sized to full Xvfb screen)…');
+  console.log('Launching Chrome at native ' + W + 'x' + H + ' (DPR 1, no scaling)…');
   const browser = await puppeteer.launch({
     executablePath: '/usr/bin/google-chrome-stable',
     headless: false,
@@ -53,12 +51,9 @@ async function main(){
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu-sandbox',
-      // Window matches the FULL Xvfb screen — this is critical.
-      // No kiosk, no window-size fighting the display size.
-      '--window-size=' + OUT_W + ',' + OUT_H,
+      '--window-size=' + W + ',' + H,
       '--window-position=0,0',
-      '--force-device-scale-factor=' + SCALE,
+      '--force-device-scale-factor=1',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-infobars',
@@ -67,18 +62,19 @@ async function main(){
       '--disable-component-update',
       '--disable-background-networking',
       '--start-maximized',
+      // Font rendering: use full subpixel AA, no hinting tricks
+      '--font-render-hinting=medium',
+      '--enable-font-antialiasing',
+      '--disable-lcd-text=false',
     ],
   });
 
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
-
-  // Puppeteer's viewport override is the reliable one — it talks to
-  // Chrome DevTools Protocol directly, unlike the launch flag.
   await page.setViewport({
-    width: LAYOUT_W,
-    height: LAYOUT_H,
-    deviceScaleFactor: SCALE,
+    width: W,
+    height: H,
+    deviceScaleFactor: 1,
   });
 
   page.on('dialog', async d => { try { await d.accept(); } catch(e){} });
@@ -107,36 +103,27 @@ async function main(){
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
   await sleep(5000);
 
-  // ── DIAGNOSTIC: print what Chrome thinks the viewport is ──
   const diag = await page.evaluate(() => ({
     innerW: window.innerWidth,
     innerH: window.innerHeight,
     dpr: window.devicePixelRatio,
-    physicalW: window.innerWidth * window.devicePixelRatio,
-    physicalH: window.innerHeight * window.devicePixelRatio,
   }));
-  console.log('▶ Chrome viewport: ' + diag.innerW + 'x' + diag.innerH +
-              ' CSS px @ DPR ' + diag.dpr +
-              ' = ' + diag.physicalW + 'x' + diag.physicalH + ' physical px');
-  console.log('▶ Expected: ' + LAYOUT_W + 'x' + LAYOUT_H + ' @ ' + SCALE +
-              ' = ' + OUT_W + 'x' + OUT_H);
-  if(diag.dpr !== SCALE){
-    console.log('⚠ WARNING: DPR is ' + diag.dpr + ' not ' + SCALE +
-                ' — the video will NOT be true 4K');
-  }
+  console.log('▶ Viewport: ' + diag.innerW + 'x' + diag.innerH + ' CSS @ DPR ' + diag.dpr);
+  console.log('▶ Native render: ' + (diag.innerW * diag.dpr) + 'x' + (diag.innerH * diag.dpr) + ' physical px');
+  console.log('▶ Expected: ' + W + 'x' + H + ' — should match above');
 
-  console.log('Starting ffmpeg…');
+  console.log('Starting ffmpeg (native, no scaling)…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
     '-f', 'x11grab',
     '-framerate', String(FPS),
-    '-video_size', OUT_W + 'x' + OUT_H,
+    '-video_size', W + 'x' + H,
     '-draw_mouse', '1',
     '-i', ':99',
     '-c:v', 'libx264',
-    '-preset', 'medium',
-    '-crf', '14',
-    '-tune', 'stillimage',
+    '-preset', 'slow',
+    '-crf', '12',
+    '-tune', 'film',
     '-pix_fmt', 'yuv420p',
     '-colorspace', 'bt709',
     '-color_primaries', 'bt709',
@@ -157,17 +144,14 @@ async function main(){
   }catch(e){ console.error('Replay error:', e); }
 
   await sleep(1500);
-
   console.log('Stopping ffmpeg…');
   ffmpeg.stdin.write('q');
   await new Promise(r => ffmpeg.on('exit', r));
 
   await browser.close();
   server.close();
-
   const size = fs.statSync('output.mp4').size;
-  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' +
-              OUT_W + 'x' + OUT_H + ' @ ' + FPS + 'fps');
+  console.log('✓ output.mp4 — ' + (size / 1048576).toFixed(1) + ' MB at ' + W + 'x' + H + ' @ ' + FPS + 'fps');
 }
 
 async function replayEvents(page, events){
@@ -188,7 +172,7 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + (ev.x * SCALE) + ' ' + (ev.y * SCALE));
+          await xdo('mousemove ' + ev.x + ' ' + ev.y);
           await sleep(30);
           await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
@@ -198,9 +182,7 @@ async function replayEvents(page, events){
           }, ev.target);
         }
       } else if(ev.type === 'move'){
-        if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + (ev.x * SCALE) + ' ' + (ev.y * SCALE));
-        }
+        if(ev.x != null && ev.y != null) await xdo('mousemove ' + ev.x + ' ' + ev.y);
       } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
           const el = document.querySelector(sel);
