@@ -6,7 +6,7 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,16 @@ jobs:
           sleep 3
           export DISPLAY=:99
           node render.js
+
+      - name: Show output info
+        if: always()
+        run: |
+          if [ -f output.mp4 ]; then
+            ffprobe -v error -select_streams v:0 \
+              -show_entries stream=width,height,r_frame_rate,bit_rate,duration \
+              -of default=noprint_wrappers=1 output.mp4
+            ls -la output.mp4
+          fi
 
       - name: Upload MP4
         uses: actions/upload-artifact@v4
