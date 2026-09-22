@@ -4,8 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-const W = 2560;
-const H = 1440;
+const W = 1920;
+const H = 1080;
 const FPS = 60;
 const CRF = 14;
 const PRESET = 'medium';
@@ -18,29 +18,12 @@ function xdo(args){
   });
 }
 
-/* ─────────────────────────────────────────────────────────
-   CSS OVERRIDE injected into the page at render time only.
-   Fixes the app's own max-width:1480px cap on .shell, plus any
-   other container that limits itself, so the app fills the full
-   recording frame edge to edge. The uploaded HTML file is NOT
-   modified — this override only exists inside the running render.
-   ───────────────────────────────────────────────────────── */
+/* Fill the full recording frame — injected at render time only,
+   your study-planner.html file is untouched. */
 const FILL_STYLES = `
-  html, body {
-    width: 100% !important;
-    max-width: none !important;
-    overflow-x: hidden !important;
-  }
-  .shell {
-    max-width: none !important;
-    width: 100% !important;
-    padding-left: 40px !important;
-    padding-right: 40px !important;
-  }
-  /* Kill any other element that tries to cap itself */
+  html, body { width: 100% !important; max-width: none !important; overflow-x: hidden !important; }
+  .shell { max-width: none !important; width: 100% !important; padding-left: 40px !important; padding-right: 40px !important; }
   [style*="max-width"] { max-width: none !important; }
-  /* Remove the ambient glow blobs' huge blur — they render as
-     black holes in headless Chrome and pull the eye to nothing. */
   .amb { display: none !important; }
 `;
 
@@ -49,7 +32,7 @@ async function main(){
   if(!fs.existsSync(htmlPath)) throw new Error('study-planner.html not found');
   const html = fs.readFileSync(htmlPath, 'utf8');
   console.log('Loaded HTML (' + html.length + ' bytes)');
-  console.log('Target: ' + W + 'x' + H + ' @ ' + FPS + 'fps');
+  console.log('Target: ' + W + 'x' + H + ' @ ' + FPS + 'fps · CRF ' + CRF);
 
   let events = null;
   const evPath = path.join(__dirname, 'events.json');
@@ -96,9 +79,6 @@ async function main(){
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
 
-  // Force the OS window to fill the Xvfb display via X11 directly —
-  // headless Chrome without a window manager doesn't always honor
-  // --window-size, which left the app rendered small in past runs.
   try{
     const winId = await new Promise(res => {
       exec("xdotool search --onlyvisible --class 'google-chrome' | head -n1",
@@ -109,9 +89,8 @@ async function main(){
     if(winId){
       await xdo('windowsize ' + winId + ' ' + W + ' ' + H);
       await xdo('windowmove ' + winId + ' 0 0');
-      console.log('Chrome window forced to ' + W + 'x' + H);
     }
-  }catch(e){ console.log('(window sizing via xdotool skipped)'); }
+  }catch(e){}
 
   await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
 
@@ -139,11 +118,7 @@ async function main(){
   });
 
   try { await page.evaluate(() => document.fonts.ready); } catch(e){}
-
-  // Inject the fill-the-frame override.
   await page.addStyleTag({ content: FILL_STYLES });
-  console.log('Injected full-width override');
-
   await sleep(3500);
 
   const vp = await page.evaluate(() => ({
@@ -153,7 +128,6 @@ async function main(){
   }));
   console.log('Viewport: ' + vp.w + 'x' + vp.h + ' · .shell width: ' + vp.shellW);
 
-  /* FFMPEG CAPTURE */
   console.log('Starting ffmpeg…');
   const ffmpeg = spawn('ffmpeg', [
     '-y',
@@ -170,9 +144,9 @@ async function main(){
     '-crf', String(CRF),
     '-pix_fmt', 'yuv420p',
     '-profile:v', 'high',
-    '-level', '5.1',
-    '-maxrate', '50M',
-    '-bufsize', '100M',
+    '-level', '4.2',
+    '-maxrate', '30M',
+    '-bufsize', '60M',
     '-g', String(FPS * 2),
     '-r', String(FPS),
     '-colorspace', 'bt709',
@@ -214,11 +188,8 @@ async function replayEvents(page, events){
   console.log('Replaying ' + events.length + ' events…');
   events.sort((a, b) => a.t - b.t);
   const t0 = Date.now();
-  // events.json was recorded at 1920x1080; scale coordinates to the
-  // 2560x1440 render so clicks land on the same elements.
-  const SCALE_X = W / 1920;
-  const SCALE_Y = H / 1080;
 
+  // No scaling — render is 1920x1080, same as where events were recorded
   for(const ev of events){
     const wait = ev.t - (Date.now() - t0);
     if(wait > 0) await sleep(wait);
@@ -226,20 +197,18 @@ async function replayEvents(page, events){
     try{
       if(ev.type === 'scroll'){
         if(ev.target === 'html' || !ev.target){
-          await page.evaluate(top => window.scrollTo(0, top), (ev.top || 0) * SCALE_Y);
+          await page.evaluate(top => window.scrollTo(0, top), ev.top || 0);
         } else {
           await page.evaluate((sel, top) => {
             const el = document.querySelector(sel);
             if(el) el.scrollTop = top;
-          }, ev.target, (ev.top || 0) * SCALE_Y);
+          }, ev.target, ev.top || 0);
         }
       } else if(ev.type === 'click'){
         if(ev.x != null && ev.y != null){
-          const cx = Math.round(ev.x * SCALE_X);
-          const cy = Math.round(ev.y * SCALE_Y);
-          await xdo('mousemove ' + cx + ' ' + cy);
+          await xdo('mousemove ' + ev.x + ' ' + ev.y);
           await sleep(30);
-          await page.mouse.click(cx, cy);
+          await page.mouse.click(ev.x, ev.y);
         } else if(ev.target){
           await page.evaluate(sel => {
             const el = document.querySelector(sel);
@@ -248,7 +217,7 @@ async function replayEvents(page, events){
         }
       } else if(ev.type === 'move'){
         if(ev.x != null && ev.y != null){
-          await xdo('mousemove ' + Math.round(ev.x * SCALE_X) + ' ' + Math.round(ev.y * SCALE_Y));
+          await xdo('mousemove ' + ev.x + ' ' + ev.y);
         }
       } else if(ev.type === 'input'){
         await page.evaluate((sel, val) => {
@@ -268,7 +237,6 @@ async function replayEvents(page, events){
 async function scriptedTour(page){
   console.log('Scripted tour…');
   await sleep(2000);
-
   await page.evaluate(async () => {
     const max = document.body.scrollHeight - window.innerHeight;
     const steps = 200, dt = 30;
@@ -280,7 +248,6 @@ async function scriptedTour(page){
     }
   });
   await sleep(1000);
-
   await page.evaluate(async () => {
     const start = window.scrollY;
     const steps = 150, dt = 25;
@@ -292,7 +259,6 @@ async function scriptedTour(page){
     }
   });
   await sleep(500);
-
   const click = async sel => { try { await page.click(sel); return true; } catch(e){ return false; } };
   await click('.ai-report-btn');  await sleep(7000);
   await click('.mcls');           await sleep(800);
