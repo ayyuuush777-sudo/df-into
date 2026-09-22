@@ -7,7 +7,7 @@ const { spawn, exec } = require('child_process');
 // ── Viewport: phone-shaped, below your app's 1100px breakpoint ──
 const VIEW_W = 1000;        // CSS px — below 1100, so stacked/phone layout
 const VIEW_H = 562;         // 16:9
-const DPR = 2.56;           // 1000 × 2.56 = 2560 CSS-px × DPR = physical
+const DPR = 3.2;           // 1000 × 2.56 = 2560 CSS-px × DPR = physical
 // Output
 const OUT_W = Math.round(VIEW_W * DPR);  // 2560
 const OUT_H = Math.round(VIEW_H * DPR);  // 1440
